@@ -250,7 +250,7 @@ class DocReader(object):
                     tmp1 = score_s[i][target_s[i][0][0]]*score_e[i][target_s[i][0][1]]
                     for j in range(1, len(target_s[i])):
                         if (type_max):
-                            if (tmp1.data.cpu().numpy()[0]<(score_s[i][target_s[i][j][0]]*score_e[i][target_s[i][j][1]]).data.cpu().numpy()[0]):
+                            if (tmp1.data.cpu().numpy()<(score_s[i][target_s[i][j][0]]*score_e[i][target_s[i][j][1]]).data.cpu().numpy()):
                                 tmp1 = score_s[i][target_s[i][j][0]]*score_e[i][target_s[i][j][1]]
                         else:
                             tmp1 += score_s[i][target_s[i][j][0]]*score_e[i][target_s[i][j][1]]
@@ -292,14 +292,32 @@ class DocReader(object):
 
         return loss.data[0], ex[0].size(0)
 
-    def update_with_doc(self, update_step, ex_with_doc, pred_s_list_doc, pred_e_list_doc, top_n, target_s_list, target_e_list, HasAnswer_list):
+    def get_answer_span(self, score_s, score_e):
+        batch_size, s_size = score_s.size()
+        _, e_size = score_e.size()
+        score = torch.bmm(score_s.unsqueeze(dim=2), score_e.unsqueeze(dim=1)).view(batch_size, -1)
+        max_score, max_index = torch.max(score, dim=1)
+        max_index = max_index.cpu().data.numpy()
+        start = max_index / e_size
+        end = max_index % s_size
+        return start, end
+
+    def update_with_doc(self, update_step, ex_with_doc, pred_s_list_doc, pred_e_list_doc, \
+                        top_n, target_s_list, target_e_list, HasAnswer_list, \
+                        evidence_label=None, return_prob=False):
         """Forward a batch of examples; step the optimizer to update weights."""
         if not self.optimizer:
             raise RuntimeError('No optimizer set.')
         # Train mode
-        self.network.train()
-        self.selector.train()
+        if return_prob:
+            self.network.eval()
+            self.selector.eval()
+        else:
+            self.network.train()
+            self.selector.train()
         batch_size = ex_with_doc[0][0].size(0)
+        if evidence_label is None:
+            evidence_label = [-1] * batch_size
         num_docs = int(vector.num_docs/3)
         for idx_doc in range(num_docs):
             pred_s_list_doc[idx_doc] = pred_s_list_doc[idx_doc].cuda(async=True)
@@ -327,22 +345,42 @@ class DocReader(object):
         for i in range(batch_size):
             for idx_doc in range(num_docs):
                 num_answer[i] += HasAnswer_list[idx_doc][i][0]
+        max_value, max_index = [-1] * batch_size, [-1] * batch_size
         for idx_doc in range(num_docs):    
             # Run forward
             inputs = inputs_list[idx_doc]
             score_s, score_e,_,_ = self.network(*inputs)
+            start, end = self.get_answer_span(score_s, score_e)
             for i in range(batch_size):
                 if (HasAnswer_list[idx_doc][i][0]):
-                    loss += 0.5*Variable(torch.FloatTensor([1.0/num_answer[i]]).cuda()) * (-(scores_doc_norm[i][idx_doc]+1e-16).log() + Variable(torch.FloatTensor([1.0/num_answer[i]]).cuda().log()))
+                    #if evidence_label[i] == -1:
+                    #    loss += 0.5*Variable(torch.FloatTensor([1.0/num_answer[i]]).cuda()) * (-(scores_doc_norm[i][idx_doc]+1e-16).log() + Variable(torch.FloatTensor([1.0/num_answer[i]]).cuda().log()))
                     tmp1 = score_s[i][target_s_list[idx_doc][i][0][0]]*score_e[i][target_s_list[idx_doc][i][0][1]]
                     for j in range(1, len(target_s_list[idx_doc][i])):
                         if (type_max):
-                            if (tmp1.data.cpu().numpy()[0]<( score_s[i][target_s_list[idx_doc][i][j][0]]*score_e[i][target_s_list[idx_doc][i][j][1]]).data.cpu().numpy()[0]):
+                            if (tmp1.data.cpu().numpy()<( score_s[i][target_s_list[idx_doc][i][j][0]]*score_e[i][target_s_list[idx_doc][i][j][1]]).data.cpu().numpy()):
                                 tmp1 =  score_s[i][target_s_list[idx_doc][i][j][0]]*score_e[i][target_s_list[idx_doc][i][j][1]]
                         else:
                             tmp1 +=  score_s[i][target_s_list[idx_doc][i][j][0]]*score_e[i][target_s_list[idx_doc][i][j][1]]
                     loss_by_batch[i] += tmp1*scores_doc_norm[i][idx_doc]
                     flag[i] = True
+
+                    tmp2 = tmp1#*scores_doc_norm[i][idx_doc]
+                    if tmp2.data.cpu().numpy() > max_value[i]:
+                        for _start, _end in target_s_list[idx_doc][i]:
+                            if _start == start[i] and _end == end[i]:   
+                                max_value[i] = tmp2.data.cpu().numpy()
+                                max_index[i] = idx_doc
+
+        if return_prob:
+            loss_by_batch = [x.cpu().data.numpy() if type(x) != float else x for x in loss_by_batch]
+            return loss_by_batch, (max_value, max_index)
+
+        evidence_loss_by_batch = [0. for i in range(batch_size)]
+        for i in range(batch_size):
+            if evidence_label[i] == -1:
+                continue
+            evidence_loss_by_batch[i] = .8 * (scores_doc_norm[i][evidence_label[i]]+1e-16).log()
                     
         num_items1 = 0
         for i in range(batch_size):
@@ -351,6 +389,7 @@ class DocReader(object):
         for i in range(batch_size):
             if (flag[i]):
                 loss-=1.0/num_items1*((loss_by_batch[i]+1e-16).log())
+                loss-=1.0/num_items1*evidence_loss_by_batch[i]
                 tot_flag = True
         if (num1>0):
             tot_flag = True
@@ -406,7 +445,7 @@ class DocReader(object):
             for idx_doc in range(num_docs):
                 if (HasAnswer_list[idx_doc][i]==1):
                     flag = True
-                    if (scores_doc_norm[i][idx_doc].data.cpu().numpy()[0]>1e-16):
+                    if (scores_doc_norm[i][idx_doc].data.cpu().numpy()>1e-16):
                         loss += Variable(torch.FloatTensor([1.0/num_answer]).cuda()) * (-(scores_doc_norm[i][idx_doc]+1e-16).log() + Variable(torch.FloatTensor([1.0/num_answer]).cuda().log()))
                    
                     tmp1 += scores_doc_norm[i][idx_doc]

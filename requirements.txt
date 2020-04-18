@@ -1,0 +1,10 @@
+torch==0.4.1
+numpy
+scikit-learn
+termcolor
+regex
+tqdm
+prettytable
+scipy
+nltk
+pexpect==4.2.1
