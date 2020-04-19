@@ -33,6 +33,7 @@ for i in range(recurrent_times):
 
     cmd = "env CUDA_VISIBLE_DEVICES=%d \
     		python main.py \
+            --gpu %d \
             --batch-size 32 \
             --model-name quasart_all \
             --num-epochs 5 \
@@ -42,7 +43,7 @@ for i in range(recurrent_times):
             --model-dir %s \
             --top_k %d \
             --load_evidence_file %s \
-            --save_evidence_file %s" % (args.gpu, output_dir, top_k, load_evidence_file, save_evidence_file)
+            --save_evidence_file %s" % (args.gpu, args.gpu, output_dir, top_k, load_evidence_file, save_evidence_file)
 
     if i > 0:
         os.system(cmd)

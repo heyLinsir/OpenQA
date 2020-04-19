@@ -353,6 +353,7 @@ class DocReader(object):
             start, end = self.get_answer_span(score_s, score_e)
             for i in range(batch_size):
                 if (HasAnswer_list[idx_doc][i][0]):
+                    loss += 0.5*Variable(torch.FloatTensor([1.0/num_answer[i]]).cuda()) * (-(scores_doc_norm[i][idx_doc]+1e-16).log() + Variable(torch.FloatTensor([1.0/num_answer[i]]).cuda().log()))
                     #if evidence_label[i] == -1:
                     #    loss += 0.5*Variable(torch.FloatTensor([1.0/num_answer[i]]).cuda()) * (-(scores_doc_norm[i][idx_doc]+1e-16).log() + Variable(torch.FloatTensor([1.0/num_answer[i]]).cuda().log()))
                     tmp1 = score_s[i][target_s_list[idx_doc][i][0][0]]*score_e[i][target_s_list[idx_doc][i][0][1]]

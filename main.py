@@ -12,13 +12,13 @@ import sys
 import subprocess
 import logging
 import random
+import pickle
 
 import regex as re
 
-sys_dir = '/data/disk2/private/linyankai/OpenQA'
+sys_dir = '/home/niuyilin/OpenQA-STM'
 sys.path.append(sys_dir)
 
-os.environ["CUDA_VISIBLE_DEVICES"]='4'
 from src.reader import utils, vector, config, data
 from src.reader import DocReader
 from src import DATA_DIR as DRQA_DATA
@@ -80,6 +80,15 @@ def add_train_args(parser):
                          help='Batch size for training')
     runtime.add_argument('--test-batch-size', type=int, default=64,
                          help='Batch size during validation/testing')
+
+    # Co-Training
+    cotraining = parser.add_argument_group('CoTraining')
+    cotraining.add_argument('--top_k', type=int, default=2000,
+                         help='Number of labeling samples in Co-Training')
+    cotraining.add_argument('--load_evidence_file', type=str, default='none',
+                         help='Path of sentence id file')
+    cotraining.add_argument('--save_evidence_file', type=str, default='none',
+                         help='Path of sentence id file')
 
     # Files
     files = parser.add_argument_group('Filesystem')
@@ -225,11 +234,113 @@ def train(args, data_loader, model, global_stats, exs_with_doc, docs_by_question
         else:
             HasAnswer_list = HasAnswer_Map[idx]
 
+        if (idx not in Evidence_Label):
+            Evidence_list = [-1] * batch_size
+            Evidence_Label[idx] = Evidence_list
+        else:
+            Evidence_list = Evidence_Label[idx]
+
         weights = []
         for idx_doc in range(0, vector.num_docs):
             weights.append(1)
         weights = torch.Tensor(weights)
         idx_random = torch.multinomial(weights, int(vector.num_docs))
+        idx_doc_map = {int(idx_doc): i for i, idx_doc in enumerate(idx_random)}
+        idx_doc_map[-1] = -1
+
+        HasAnswer_list_sample = []
+        Evidence_list_sample = []
+        ex_with_doc_sample = []
+        for i, idx_doc in enumerate(idx_random):
+            HasAnswer_list_sample.append(HasAnswer_list[idx_doc])
+            ex_with_doc_sample.append(ex_with_doc[idx_doc])
+        for i in range(batch_size):
+            Evidence_list_sample.append(idx_doc_map[Evidence_list[i]])
+
+        l_list_doc = []
+        r_list_doc = []
+        for idx_doc in idx_random:
+            l_list = []
+            r_list = []
+            for i in range(batch_size):
+                if HasAnswer_list[idx_doc][i][0]:
+                    l_list.append(HasAnswer_list[idx_doc][i][1])
+                else:
+                    l_list.append((-1,-1))
+            l_list_doc.append(l_list)
+            r_list_doc.append(r_list)
+        pred_s_list_doc = []
+        pred_e_list_doc = []
+        tmp_top_n = 1
+        for idx_doc in idx_random:
+            ex = ex_with_doc[idx_doc]
+            pred_s, pred_e, pred_score = model.predict(ex,top_n = tmp_top_n)
+            pred_s_list = []
+            pred_e_list = []
+            for i in range(batch_size):
+                pred_s_list.append(pred_s[i].tolist())
+                pred_e_list.append(pred_e[i].tolist())
+            pred_s_list_doc.append(torch.LongTensor(pred_s_list))
+            pred_e_list_doc.append(torch.LongTensor(pred_e_list))
+
+        _loss = model.update_with_doc(update_step, ex_with_doc_sample, \
+                            pred_s_list_doc, pred_e_list_doc, tmp_top_n, \
+                            l_list_doc, r_list_doc, HasAnswer_list_sample, \
+                            evidence_label=Evidence_list_sample)
+        train_loss.update(*_loss)
+        update_step = (update_step + 1) % 4
+        if idx % args.display_iter == 0:
+            logger.info('train: Epoch = %d | iter = %d/%d | ' %
+                        (global_stats['epoch'], idx, len(data_loader)) +
+                        'loss = %.2f | elapsed time = %.2f (s)' %
+                        (train_loss.avg, global_stats['timer'].time()))
+            train_loss.reset()
+        if (idx%200==199):
+            validate_unofficial_with_doc(args, data_loader, model, global_stats, exs_with_doc, docs_by_question, 'train')
+        # break
+    logger.info('train: Epoch %d done. Time for epoch = %.2f (s)' %
+                (global_stats['epoch'], epoch_time.time()))
+
+    # Checkpoint
+    if args.checkpoint:
+        model.checkpoint(args.model_file + '.checkpoint',
+                         global_stats['epoch'] + 1)
+
+
+def update_evidence(args, data_loader, model, global_stats, exs_with_doc, docs_by_question):
+    Top_k = args.top_k
+    logger.info('Top k is set to %d' % (Top_k))
+
+    Probability = {}
+    Attention_Weight = {}
+
+    """Run through one epoch of model training with the provided data loader."""
+    # Initialize meters + timers
+    train_prob = utils.AverageMeter()
+    train_attention = utils.AverageMeter()
+    epoch_time = utils.Timer()
+    # Run one epoch
+    update_step = 0
+    for idx, ex_with_doc in enumerate(data_loader):
+        ex = ex_with_doc[0]
+        batch_size, question, ex_id = ex[0].size(0), ex[3], ex[-1]
+        if (idx not in HasAnswer_Map):
+            HasAnswer_list = []
+            for idx_doc in range(0, vector.num_docs):
+                HasAnswer = []
+                for i in range(batch_size):
+                    HasAnswer.append(has_answer(args, exs_with_doc[ex_id[i]]['answer'], docs_by_question[ex_id[i]][idx_doc%len(docs_by_question[ex_id[i]])]["document"]))
+                HasAnswer_list.append(HasAnswer)
+            HasAnswer_Map[idx] = HasAnswer_list
+        else:
+            HasAnswer_list = HasAnswer_Map[idx]
+
+        if (idx not in Evidence_Label):
+            Evidence_list = [-1] * batch_size
+            Evidence_Label[idx] = Evidence_list
+
+        # Don't shuffle when update evidence
+        idx_random = range(vector.num_docs)
 
         HasAnswer_list_sample = []
         ex_with_doc_sample = []
@@ -263,25 +374,53 @@ def train(args, data_loader, model, global_stats, exs_with_doc, docs_by_question
             pred_s_list_doc.append(torch.LongTensor(pred_s_list))
             pred_e_list_doc.append(torch.LongTensor(pred_e_list))
 
-        train_loss.update(*model.update_with_doc(update_step, ex_with_doc_sample, pred_s_list_doc, pred_e_list_doc,  tmp_top_n, l_list_doc,r_list_doc,HasAnswer_list_sample))
+        probs, attentions = model.update_with_doc(update_step, ex_with_doc_sample, \
+                                        pred_s_list_doc, pred_e_list_doc, tmp_top_n, \
+                                        l_list_doc, r_list_doc, HasAnswer_list_sample, \
+                                        return_prob=True)
+        train_prob.update(np.mean(probs), batch_size)
+        train_attention.update(np.mean(attentions[0]), batch_size)
         update_step = (update_step + 1) % 4
-        if idx % args.display_iter == 0:
-            logger.info('train: Epoch = %d | iter = %d/%d | ' %
-                        (global_stats['epoch'], idx, len(data_loader)) +
-                        'loss = %.2f | elapsed time = %.2f (s)' %
-                        (train_loss.avg, global_stats['timer'].time()))
-            train_loss.reset()
-        if (idx%200==199):
-            validate_unofficial_with_doc(args, data_loader, model, global_stats, exs_with_doc, docs_by_question, 'train')
-    logger.info('train: Epoch %d done. Time for epoch = %.2f (s)' %
-                (global_stats['epoch'], epoch_time.time()))
 
-    # Checkpoint
-    if args.checkpoint:
-        model.checkpoint(args.model_file + '.checkpoint',
-                         global_stats['epoch'] + 1)
+        if idx % args.display_iter == 0:
+            logger.info('Update Evidence: Epoch = %d | iter = %d/%d | ' %
+                        (global_stats['epoch'], idx, len(data_loader)) +
+                        'Average prob = %f | Average attention = %f | elapsed time = %.2f (s)' %
+                        (train_prob.avg, train_attention.avg, global_stats['timer'].time()))
+
+        for i in range(batch_size):
+            key = "%d|%d" % (idx, i)
+            if key in Probability or key in Attention_Weight:
+                raise ValueError("%s exists in Probability or Attention_Weight" % (key))
+            # Add threshold here
+            Probability[key] = probs[i]
+            Attention_Weight[key] = (attentions[0][i], attentions[1][i]) # max_value, max_index
+        # break
+    evidence_scores = {key: (attention[0], attention[1]) for key, attention in Attention_Weight.items() if attention[1] != -1}
+    evidence_scores = sorted(evidence_scores.items(), key=lambda x: x[1][0], reverse=True)
+    count = 0
+    label_prob = []
+    label_attention = []
+    for key, value in evidence_scores:
+        idx, i = key.split('|')
+        idx = int(idx)
+        i = int(i)
+        if Evidence_Label[idx][i] != -1:
+            continue
+        count += 1
+        Evidence_Label[idx][i] = value[1]
+        label_prob.append(Probability[key])
+        label_attention.append(Attention_Weight[key][0])
+        if count >= Top_k:
+            break
+
+    logger.info('Update Evidence: Epoch %d done. Time for epoch = %.2f (s). Average prob = %f. Average attention = %f.' %
+                (global_stats['epoch'], epoch_time.time(), train_prob.avg, train_attention.avg))
+    logger.info('Update Evidence: Label %d examples. Average prob = %f. Average attention = %f.' %
+                (count, np.mean(label_prob), np.mean(label_attention)))
 
 HasAnswer_Map = {}
+Evidence_Label = {}
 def pretrain_selector(args, data_loader, model, global_stats, exs_with_doc, docs_by_question):
     """Run through one epoch of model training with the provided data loader."""
     # Initialize meters + timers
@@ -752,7 +891,14 @@ def main(args):
                         (args.valid_metric, result[args.valid_metric],
                          stats['epoch'], model.updates))
             model.save(args.model_file)
+
             stats['best_valid'] = result[args.valid_metric]
+
+    #Update evidence label
+    if args.save_evidence_file != 'none':
+        model.load(args.model_file)
+        update_evidence(args, train_loader_with_doc, model, stats, train_exs_with_doc, train_docs)
+        pickle.dump(Evidence_Label, open(os.path.join(args.model_dir, args.model_name + '.%s.pkl' % (args.save_evidence_file)), 'wb'))
 
 def split_doc(doc):
     """Given a doc, split it into chunks (by paragraph)."""
@@ -784,6 +930,10 @@ if __name__ == '__main__':
     config.add_model_args(parser)
     args = parser.parse_args()
     set_defaults(args)
+
+    # os.environ["CUDA_VISIBLE_DEVICES"]=str(args.gpu)
+    if args.load_evidence_file != 'none':
+        Evidence_Label = pickle.load(open(os.path.join(args.model_dir, args.model_name + '.%s.pkl' % (args.load_evidence_file)), 'rb'))
 
     # Set cuda
     args.cuda = not args.no_cuda and torch.cuda.is_available()
