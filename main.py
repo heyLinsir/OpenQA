@@ -431,6 +431,8 @@ def pretrain_selector(args, data_loader, model, global_stats, exs_with_doc, docs
     tot_num = 0
     global HasAnswer_Map
     for idx, ex_with_doc in enumerate(data_loader):
+        if idx > 575:
+            continue
         ex = ex_with_doc[0]
         batch_size, question, ex_id = ex[0].size(0), ex[3], ex[-1]
         if (idx not in HasAnswer_Map):

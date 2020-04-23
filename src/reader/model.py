@@ -341,10 +341,10 @@ class DocReader(object):
         num1 = 0
         flag = [False for i in range(batch_size)]
         tot_flag = False
-        num_answer  = [0.0 for i in range(batch_size)]
+        num_answer  = [1e-15 for i in range(batch_size)]
         for i in range(batch_size):
             for idx_doc in range(num_docs):
-                num_answer[i] += HasAnswer_list[idx_doc][i][0]
+                num_answer[i] += float(HasAnswer_list[idx_doc][i][0])
         max_value, max_index = [-1] * batch_size, [-1] * batch_size
         for idx_doc in range(num_docs):    
             # Run forward
@@ -438,23 +438,26 @@ class DocReader(object):
         flag = False
         for i in range(batch_size):
             s = ''
-            num_answer = 0
+            num_answer = 1e-15
             for idx_doc in range(num_docs):
-                num_answer += HasAnswer_list[idx_doc][i]
+                num_answer += float(HasAnswer_list[idx_doc][i])
             flag1 = False
             tmp1 = 0
             for idx_doc in range(num_docs):
                 if (HasAnswer_list[idx_doc][i]==1):
                     flag = True
                     if (scores_doc_norm[i][idx_doc].data.cpu().numpy()>1e-16):
+                        
                         loss += Variable(torch.FloatTensor([1.0/num_answer]).cuda()) * (-(scores_doc_norm[i][idx_doc]+1e-16).log() + Variable(torch.FloatTensor([1.0/num_answer]).cuda().log()))
                    
                     tmp1 += scores_doc_norm[i][idx_doc]
             if (flag1):
                 loss1 -= (tmp1+1e-16).log()
                 num_items1+=1
+            
         if (num_items1>0):
             loss+= loss1/num_items1
+        
         self.optimizer.zero_grad()
         if flag:
             loss.backward()
